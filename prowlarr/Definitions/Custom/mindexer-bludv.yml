@@ -24,7 +24,7 @@ settings:
   - name: use_flaresolverr
     type: select
     label: Usar FlareSolverr
-    default: "true"
+    default: "false"
     options:
       "true": "Sim"
       "false": "Não"

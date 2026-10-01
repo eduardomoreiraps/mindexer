@@ -23,7 +23,7 @@ _log_ctx = ScraperLogContext("Bludv", logger)
 # ║ O site mudou de endereço ou de layout? Edite SOMENTE este bloco.      ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 SITE = SiteConfig(
-    url="https://bludvfilmes.xyz/",
+    url="https://bludvfilmes1.xyz/",
     caminho_busca="?s=",
     paginacao="page/{}/",
     seletores={
@@ -35,13 +35,14 @@ SITE = SiteConfig(
     },
 )
 # Cards de listagem/busca: testados nesta ordem, o primeiro que encontrar vence.
-_CARD_SELETORES = ('article.post', 'article', '.post')
+_CARD_SELETORES = ('div.post', 'article.post', 'article', '.post')
 # Link dentro do card: testados nesta ordem.
 _LINK_DO_CARD_SELETORES = (
     'header.entry-header h1.entry-title a',
     'h1.entry-title a',
     'header.entry-header a',
     'div.title > a',
+    'div.title a',
     'h2 a',
 )
 
@@ -49,7 +50,7 @@ class BludvScraper(BaseScraper):
     SCRAPER_TYPE = "bludv"
     DEFAULT_BASE_URL = SITE.url
     DISPLAY_NAME = "Bludv"
-    USE_FLARESOLVERR_DEFAULT = True
+    USE_FLARESOLVERR_DEFAULT = False
     
     def __init__(self, base_url: Optional[str] = None, use_flaresolverr: bool = False):
         super().__init__(base_url, use_flaresolverr)
