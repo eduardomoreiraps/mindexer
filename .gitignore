@@ -1,0 +1,16 @@
+# Ambientes e arquivos locais
+.env
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Dados persistentes do Prowlarr e Redis gerados em execução
+prowlarr/logs/
+prowlarr/Backups/
+prowlarr/*.db
+prowlarr/*.db-*
+prowlarr/*.pid
+prowlarr/config.xml
+redis/data/*
+!redis/data/.gitkeep
