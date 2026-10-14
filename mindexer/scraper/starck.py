@@ -30,7 +30,7 @@ _log_ctx = ScraperLogContext("Starck", logger)
 # ║ O site mudou de endereço ou de layout? Edite SOMENTE este bloco.      ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 SITE = SiteConfig(
-    url="https://www.starck-oficial.com/",
+    url="https://starckfilmes-v26.com/",
     caminho_busca="?s=",
     paginacao="page/{}/",
     seletores={

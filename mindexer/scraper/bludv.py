@@ -23,7 +23,7 @@ _log_ctx = ScraperLogContext("Bludv", logger)
 # ║ O site mudou de endereço ou de layout? Edite SOMENTE este bloco.      ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 SITE = SiteConfig(
-    url="https://bludvfilmes1.xyz/",
+    url="https://bludv.ru/",
     caminho_busca="?s=",
     paginacao="page/{}/",
     seletores={

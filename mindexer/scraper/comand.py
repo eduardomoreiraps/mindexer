@@ -45,7 +45,7 @@ class ComandScraper(BaseScraper):
     SCRAPER_TYPE = "comand"
     DEFAULT_BASE_URL = SITE.url
     DISPLAY_NAME = "Comando"
-    USE_FLARESOLVERR_DEFAULT = True
+    USE_FLARESOLVERR_DEFAULT = False
     
     def __init__(self, base_url: Optional[str] = None, use_flaresolverr: bool = False):
         super().__init__(base_url, use_flaresolverr)
