@@ -378,12 +378,196 @@ def decode_embedded_go_payload_link(href: str) -> Optional[str]:
         return None
 
 
+def _b64url_text(value: str) -> str:
+    if not value:
+        return ''
+    try:
+        raw = base64.b64decode(_pad_b64(value.replace('-', '+').replace('_', '/')))
+    except Exception:
+        return ''
+    return raw.decode('latin-1')
+
+
+def _magnet_in_text(text: str) -> Optional[str]:
+    if not text or 'magnet:' not in text.lower():
+        return None
+    match = _RE_MAGNET_FULL.search(text)
+    if not match:
+        return None
+    return html.unescape(match.group(0)).replace('&amp;', '&')
+
+
+def decode_hidden_payload(value: str) -> Optional[str]:
+    """Same cascade the download page uses, independent of the host name."""
+    if not value:
+        return None
+    raw = html.unescape(unquote(str(value))).strip()
+    if raw.lower().startswith('magnet:'):
+        return _magnet_in_text(raw) or raw
+    if len(raw) < 24:
+        return None
+
+    b64 = _b64url_text(raw)
+    unshuffled = _unshuffle_string(raw) or ''
+    b64_unshuffled = _unshuffle_string(b64) if b64 else ''
+    unshuffled_b64 = _b64url_text(unshuffled) if unshuffled else ''
+
+    for text in (b64, b64_unshuffled, unshuffled, unshuffled_b64):
+        found = _magnet_in_text(text)
+        if found:
+            return found
+    return None
+
+
+def _iter_link_payloads(href: str):
+    try:
+        parsed = urlparse(html.unescape(str(href).strip()))
+    except Exception:
+        return
+    if parsed.scheme not in ('http', 'https', ''):
+        return
+    for values in parse_qs(parsed.query).values():
+        for value in values:
+            if value:
+                yield value
+
+
+def _looks_like_opaque_token(value: str) -> bool:
+    if not value or len(value) < 40:
+        return False
+    compact = re.sub(r'[^A-Za-z0-9]', '', value)
+    return len(compact) >= 40 and len(compact) / len(value) >= 0.85
+
+
+def is_opaque_download_link(href: str) -> bool:
+    if not href or href.startswith('magnet:'):
+        return False
+    try:
+        parsed = urlparse(html.unescape(href.strip()))
+    except Exception:
+        return False
+    if parsed.scheme not in ('http', 'https'):
+        return False
+    return any(_looks_like_opaque_token(value) for value in _iter_link_payloads(href))
+
+
+def _decode_any_payload(*values) -> Optional[str]:
+    for value in values:
+        if not value:
+            continue
+        text = html.unescape(str(value)).strip()
+        found = decode_hidden_payload(text)
+        if found and found.startswith('magnet:'):
+            return found
+        if text.lower().startswith(('http://', 'https://')):
+            for piece in _iter_link_payloads(text):
+                found = decode_hidden_payload(piece)
+                if found and found.startswith('magnet:'):
+                    return found
+    return None
+
+
+def _payloads_from_gate_html(doc: BeautifulSoup, html_content: str, page_url: str):
+    if page_url:
+        yield page_url
+    if doc.body is not None:
+        data_id = doc.body.get('data-id') or ''
+        if data_id:
+            yield data_id
+    for inp in doc.select('form input[name]'):
+        value = inp.get('value') or ''
+        if _looks_like_opaque_token(value):
+            yield value
+    seen = 0
+    for match in re.finditer(r'["\']([A-Za-z0-9+/=_-]{40,})["\']', html_content or ''):
+        yield match.group(1)
+        seen += 1
+        if seen >= 12:
+            break
+
+
+def _auto_submit_form(doc: BeautifulSoup, current_url: str):
+    form = doc.select_one('form[action]')
+    if form is None:
+        return None
+    action = urljoin(current_url, html.unescape(form.get('action') or ''))
+    fields = {}
+    for inp in form.select('input[name]'):
+        name = inp.get('name')
+        if name:
+            fields[name] = inp.get('value') or ''
+    if not action or not fields:
+        return None
+    method = (form.get('method') or 'GET').upper()
+    return method, action, fields
+
+
+def _resolve_download_gate(start_url: str, session: requests.Session, base_url: str = '') -> Optional[str]:
+    pending = ('GET', start_url, None)
+    referer = base_url or start_url
+    for _hop in range(8):
+        method, current, payload = pending
+        pieces = [current]
+        if payload:
+            pieces.extend(payload.values())
+        found = _decode_any_payload(*pieces)
+        if found:
+            return found
+        try:
+            response = session.request(
+                method,
+                current,
+                data=payload if method == 'POST' else None,
+                allow_redirects=False,
+                timeout=10,
+                headers=_make_headers(referer),
+            )
+        except requests.exceptions.RequestException:
+            return None
+
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get('Location', '')
+            if location.startswith('magnet:'):
+                return html.unescape(location)
+            if not location:
+                return None
+            referer = current
+            pending = ('GET', urljoin(current, location), None)
+            continue
+        if response.status_code != 200:
+            return None
+
+        page_url = response.url or current
+        html_content = response.text or ''
+        doc = _make_soup(html_content)
+        magnet = _extract_magnet_from_html(doc, html_content)
+        if magnet:
+            return magnet
+        found = _decode_any_payload(*_payloads_from_gate_html(doc, html_content, page_url))
+        if found:
+            return found
+
+        referer = page_url
+        form = _auto_submit_form(doc, page_url)
+        if form:
+            pending = form
+            continue
+        data_id = html.unescape((doc.body.get('data-id') if doc.body is not None else '') or '')
+        if data_id.lower().startswith(('http://', 'https://')):
+            pending = ('GET', data_id, None)
+            continue
+        return None
+    return None
+
+
 def is_protected_link(href: str, protected_patterns: Optional[List[str]] = None) -> bool:
     if not href:
         return False
     if is_embedded_go_payload_link(href):
         return True
     if is_offline_decodable_link(href):
+        return True
+    if is_opaque_download_link(href):
         return True
     if protected_patterns is None:
         protected_patterns = [
@@ -729,6 +913,19 @@ def resolve_protected_link(protlink_url: str, session: requests.Session, base_ur
         logger.debug("Falha ao decodificar get.php offline, tentando via HTTP: %s", protlink_url[:100])
         # Cai para o fluxo HTTP abaixo (get.php pode redirecionar para uma
         # página com o magnet, como systemads.xyz/go.php faz).
+
+    if (
+        is_opaque_download_link(protlink_url)
+        and not is_offline_decodable_link(protlink_url)
+        and not is_go_php_link(protlink_url)
+        and not is_redirect_chain_link(protlink_url)
+    ):
+        with _REQUEST_SEMAPHORE:
+            decoded_magnet = _resolve_download_gate(protlink_url, session, base_url)
+        if decoded_magnet:
+            _cache_result(redis_client, protlink_url, decoded_magnet)
+            return decoded_magnet
+        return None
 
     redirect_count = 0
 

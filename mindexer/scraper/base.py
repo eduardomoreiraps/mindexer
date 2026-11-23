@@ -76,6 +76,7 @@ class BaseScraper(ABC):
             max_retries=Config.HTTP_RETRY_MAX_ATTEMPTS,
             pool_block=False
         )
+        self._http_adapter = adapter
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
         self.session.headers.update({
@@ -99,10 +100,11 @@ class BaseScraper(ABC):
             'trackers': {'hits': 0, 'misses': 0}
         }
         
-        self.use_flaresolverr = use_flaresolverr and Config.FLARESOLVERR_ADDRESS is not None
+        effective_use_flaresolverr = bool(use_flaresolverr or getattr(self, 'USE_FLARESOLVERR_DEFAULT', False))
+        self.use_flaresolverr = effective_use_flaresolverr and Config.FLARESOLVERR_ADDRESS is not None
         self.flaresolverr_client: Optional[FlareSolverrClient] = None
         
-        if use_flaresolverr and Config.FLARESOLVERR_ADDRESS is None:
+        if effective_use_flaresolverr and Config.FLARESOLVERR_ADDRESS is None:
             logger.warning("[[ FlareSolverr Não Conectado ]] - FLARESOLVERR_ADDRESS não configurado")
             self.use_flaresolverr = False
         
@@ -602,11 +604,14 @@ class BaseScraper(ABC):
             page_url = build_page_url(self.base_url, self.page_pattern, page)
             
             doc = self.get_document(page_url, self.base_url)
+            self._is_test = False
             if not doc:
                 return []
             
             links = self._extract_links_from_page(doc)
             effective_max = get_effective_max_items(max_items)
+            if self.use_flaresolverr:
+                effective_max = min(effective_max, 6) if effective_max > 0 else 6
             links = limit_list(links, effective_max)
             
             all_torrents = process_links_parallel(
@@ -666,6 +671,12 @@ class BaseScraper(ABC):
                     links.append(absolute_url)
                     seen_urls.add(absolute_url)
 
+            if self.use_flaresolverr and links:
+                break
+
+        if self.use_flaresolverr and len(links) > 10:
+            links = links[:10]
+
         return links
 
     def _normalize_search_result_url(self, href: str) -> str:
@@ -682,15 +693,19 @@ class BaseScraper(ABC):
         article_selectors = [
             'article.post',
             'article',
+            'a.card',
             '.post',
             '.item',
             '.result',
         ]
         link_selectors = [
+            'a.film-card-link',
             'h1.entry-title a',
             'h2.entry-title a',
             'h3.entry-title a',
             'header.entry-header a',
+            'div.title > a',
+            'div.title a',
             'h1 a',
             'h2 a',
             'h3 a',
@@ -699,14 +714,22 @@ class BaseScraper(ABC):
         for article_sel in article_selectors:
             for article in doc.select(article_sel):
                 link_elem = None
-                for link_sel in link_selectors:
-                    link_elem = article.select_one(link_sel)
-                    if link_elem:
-                        break
+                if article.name == 'a' and article.get('href'):
+                    link_elem = article
+                else:
+                    for link_sel in link_selectors:
+                        link_elem = article.select_one(link_sel)
+                        if link_elem:
+                            break
                 if not link_elem:
                     continue
                 href = (link_elem.get('href') or '').strip()
-                title_text = link_elem.get_text(strip=True)
+                title_heading = link_elem.select_one('.film-card-title, h1, h2, h3')
+                title_text = (
+                    title_heading.get_text(' ', strip=True)
+                    if title_heading
+                    else link_elem.get_text(' ', strip=True)
+                )
                 normalized = self._normalize_search_result_url(href)
                 if normalized and title_text:
                     title_by_url[normalized] = title_text
@@ -752,10 +775,10 @@ class BaseScraper(ABC):
         if not query.strip():
             return False
 
-        from utils.text.query import check_query_match
+        from utils.text.query import check_query_match, query_for_catalog_page
 
         if check_query_match(
-            query,
+            query_for_catalog_page(query),
             page_title or '',
             original_title or '',
             title_translated or '',

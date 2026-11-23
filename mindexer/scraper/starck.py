@@ -8,7 +8,7 @@ import logging
 from datetime import datetime
 from utils.parsing.date_extraction import parse_date_from_string
 from typing import List, Dict, Optional, Callable, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from app.config import Config
@@ -16,6 +16,7 @@ from scraper.base import BaseScraper
 from scraper.site_config import SiteConfig
 from utils.http.proxy import get_proxy_dict, get_proxy_url, is_proxy_local
 from magnet.parser import MagnetParser
+from utils.text.cleaning import remove_accents
 from utils.text.utils import find_year_from_text, find_sizes_from_text
 from utils.parsing.audio_extraction import detect_audio_from_html
 from utils.logging import format_error, format_link_preview, ScraperLogContext
@@ -30,7 +31,7 @@ _log_ctx = ScraperLogContext("Starck", logger)
 # ║ O site mudou de endereço ou de layout? Edite SOMENTE este bloco.      ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 SITE = SiteConfig(
-    url="https://starckfilmes-v26.com/",
+    url="https://www.starckfilmes-v31.com/",
     caminho_busca="?s=",
     paginacao="page/{}/",
     seletores={
@@ -239,6 +240,11 @@ def _invalidate_starck_gate_cache(redis, url: str) -> None:
         pass
 
 
+_STARCK_VERSION_RE = re.compile(r'(?i)(starckfilmes-v)(\d+)')
+_STARCK_VERSION_STEPS = 3
+_STARCK_VERSION_TIMEOUT = 2
+
+
 def _normalize_starck_base_url(url: str) -> Optional[str]:
     if not url or not url.startswith('http'):
         return None
@@ -246,6 +252,84 @@ def _normalize_starck_base_url(url: str) -> Optional[str]:
     if not parsed.scheme or not parsed.netloc:
         return None
     return f'{parsed.scheme}://{parsed.netloc}/'
+
+
+def _starck_version_urls(base_url: str) -> List[str]:
+    normalized = _normalize_starck_base_url(base_url) or base_url
+    parsed = urlparse(normalized)
+    match = _STARCK_VERSION_RE.search(parsed.netloc)
+    if not match:
+        return [normalized]
+    number = int(match.group(2))
+    urls = []
+    for step in range(0, _STARCK_VERSION_STEPS + 1):
+        host = (
+            parsed.netloc[:match.start()]
+            + match.group(1)
+            + str(number + step)
+            + parsed.netloc[match.end():]
+        )
+        urls.append(f'{parsed.scheme}://{host}/')
+    return urls
+
+
+def _rewrite_starck_host(url: str, base_url: str) -> str:
+    if not url or not str(url).startswith('http'):
+        return url
+    parsed = urlparse(url)
+    base = urlparse(base_url)
+    if not _STARCK_VERSION_RE.search(parsed.netloc) or not _STARCK_VERSION_RE.search(base.netloc):
+        return url
+    if parsed.netloc == base.netloc and parsed.scheme == base.scheme:
+        return url
+    return parsed._replace(scheme=base.scheme, netloc=base.netloc).geturl()
+
+
+def _starck_season_from_title(page_title: str) -> str:
+    text = remove_accents(page_title or '').lower().replace('ª', 'a').replace('º', 'o')
+    match = re.search(r'(\d{1,2})\s*a?\s*temporada', text)
+    if not match:
+        match = re.search(r'temporada\s*(\d{1,2})', text)
+    if not match:
+        return ''
+    number = int(match.group(1))
+    if number <= 0 or number > 99:
+        return ''
+    return str(number).zfill(2)
+
+
+def _starck_episode_code(label: str, season: str) -> str:
+    if not season:
+        return ''
+    text = re.sub(r'\s+', ' ', remove_accents(label or '').lower())
+    match = re.search(
+        r'episodio?s?\s*(\d{1,2})\s*(?:ao|ate|a|e)\s*(\d{1,2})',
+        text,
+    )
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2))
+        if 0 < start < end <= 99:
+            return f"S{season}E{start:02d}-{end:02d}"
+    match = re.search(r'episodio\s*(\d{1,2})', text)
+    if match:
+        episode = int(match.group(1))
+        if 0 < episode <= 99:
+            return f"S{season}E{episode:02d}"
+    return ''
+
+
+def _starck_quality_token(text: str) -> str:
+    match = re.search(r'(?i)\b(2160p|1080p|720p|480p|4k)\b', text or '')
+    return match.group(1).lower() if match else ''
+
+
+def _starck_magnet_with_display_name(magnet: str, display_name: str) -> str:
+    if not magnet or not display_name:
+        return magnet
+    if re.search(r'(?:^|[?&])dn=', magnet, re.I):
+        return magnet
+    return magnet + '&dn=' + quote(display_name)
 
 
 def _post_starck_verification_requests(
@@ -439,6 +523,9 @@ class StarckScraper(BaseScraper):
         self._gate_bypass_attempted: set = set()
 
     def _fetch_document(self, url: str, referer: str = ''):
+        url = _rewrite_starck_host(url, self.base_url)
+        if referer:
+            referer = _rewrite_starck_host(referer, self.base_url)
         soup = super()._fetch_document(url, referer)
         page_html = self._get_fetched_html() or ''
 
@@ -684,10 +771,46 @@ class StarckScraper(BaseScraper):
         # decodifica offline (AES com rastrear=Stark) nem via HTTP — gerava os
         # logs "Falha ao decodificar get.php". Priorizamos o data-u e só
         # tentamos o href quando a âncora não tem data-u.
-        page_html = self._get_fetched_html()
-        _append_decoded_magnets_from_data_u_values(_starck_raw_data_u_values(page_html))
-
         buttons_root = post.select_one(SITE.seletores["botoes_download"]) or post
+        season_code = _starck_season_from_title(page_title)
+        dual_section = False
+        for block in buttons_root.find_all(['h3', 'p']):
+            if block.name == 'h3':
+                heading = remove_accents(block.get_text(' ', strip=True)).lower()
+                dual_section = 'dual' in heading
+                continue
+            data_elem = block.select_one('[data-u]')
+            if not data_elem:
+                continue
+            data_u_value = html.unescape((data_elem.get('data-u') or '').strip())
+            if not data_u_value or data_u_value in seen_data_u:
+                continue
+            decoded_magnet = decode_data_u(data_u_value)
+            if not decoded_magnet or not decoded_magnet.startswith('magnet:'):
+                continue
+            seen_data_u.add(data_u_value)
+            try:
+                display_name = MagnetParser.parse(decoded_magnet).get('display_name') or ''
+            except Exception:
+                display_name = ''
+            if not display_name.strip():
+                label = block.get_text(' ', strip=True)
+                episode_code = _starck_episode_code(label, season_code)
+                quality = _starck_quality_token(data_elem.get_text(' ', strip=True) or label)
+                name_parts = [episode_code]
+                if not episode_code and original_title:
+                    name_parts = [re.sub(r'\s+', '.', original_title.strip())]
+                if year:
+                    name_parts.append(str(year))
+                name_parts.append('WEB-DL')
+                if quality:
+                    name_parts.append(quality)
+                if dual_section or ('dual' in remove_accents(label).lower()):
+                    name_parts.append('DUAL')
+                synthetic = '.'.join(part for part in name_parts if part)
+                decoded_magnet = _starck_magnet_with_display_name(decoded_magnet, synthetic)
+            _add_magnet(decoded_magnet)
+
         for elem in buttons_root.select('[data-u]'):
             data_u_value = (elem.get('data-u') or '').strip()
             if not data_u_value or data_u_value in seen_data_u:
@@ -696,6 +819,9 @@ class StarckScraper(BaseScraper):
             decoded_magnet = decode_data_u(data_u_value)
             if decoded_magnet:
                 _add_magnet(decoded_magnet)
+
+        page_html = self._get_fetched_html()
+        _append_decoded_magnets_from_data_u_values(_starck_raw_data_u_values(page_html))
 
         # Fallback: âncoras sem data-u (magnets diretos ou links protegidos
         # resolvíveis via href). Pula get.php do Starck, que nunca resolve.
@@ -706,8 +832,40 @@ class StarckScraper(BaseScraper):
             if not href or 'get.php' in href.lower():
                 continue
             resolved_magnet = self._resolve_link(href)
-            if resolved_magnet:
-                _add_magnet(resolved_magnet)
+            if not resolved_magnet:
+                continue
+            try:
+                display_name = MagnetParser.parse(resolved_magnet).get('display_name') or ''
+            except Exception:
+                display_name = ''
+            in_buttons = buttons_root is not None and any(parent is buttons_root for parent in link.parents)
+            if not display_name.strip() and in_buttons:
+                button = link.find_parent('span', class_='btn-down')
+                paragraph = link.find_parent('p')
+                if paragraph:
+                    label = paragraph.get_text(' ', strip=True)
+                elif button:
+                    label = button.get_text(' ', strip=True)
+                else:
+                    label = link.get_text(' ', strip=True)
+                episode_code = _starck_episode_code(label, season_code)
+                quality = _starck_quality_token(label)
+                dual = dual_section or ('dual' in remove_accents(label).lower())
+                name_parts = []
+                if episode_code:
+                    name_parts.append(episode_code)
+                elif original_title:
+                    name_parts.append(re.sub(r'\s+', '.', original_title.strip()))
+                if year:
+                    name_parts.append(str(year))
+                name_parts.append('WEB-DL')
+                if quality:
+                    name_parts.append(quality)
+                if dual:
+                    name_parts.append('DUAL')
+                synthetic = '.'.join(part for part in name_parts if part)
+                resolved_magnet = _starck_magnet_with_display_name(resolved_magnet, synthetic)
+            _add_magnet(resolved_magnet)
 
         if not magnet_links:
 

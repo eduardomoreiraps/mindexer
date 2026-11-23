@@ -229,6 +229,18 @@ def filter_urls_by_query_year(
             filtered.append(url)
     return filtered
 
+def query_for_catalog_page(query: str) -> str:
+    """Páginas de catálogo nomeiam a temporada, não SxxExx. Mantém a temporada na checagem."""
+    if not query:
+        return ''
+
+    def repl(match):
+        return f"temporada {int(match.group(1))}"
+
+    replaced = re.sub(r'(?i)\bs(\d{1,2})e\d{1,2}\b', repl, str(query))
+    return re.sub(r'\s+', ' ', replaced).strip()
+
+
 def check_query_match(query: str, title: str, title_original_html: str = '', title_translated_html: str = '') -> bool:
     query = str(query) if query is not None else ''
     title = str(title) if title is not None else ''

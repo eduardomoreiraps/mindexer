@@ -194,9 +194,31 @@ def prepare_release_title(
     result = original_release_title.strip()
     return result
 
+def _normalize_ao_episode_range(text: str) -> str:
+    if not text:
+        return text
+
+    def repl(match):
+        season = match.group(1).zfill(2)
+        start = int(match.group(2))
+        end = int(match.group(3))
+        if end <= start or end > 99:
+            return match.group(0)
+        return f"S{season}E{start:02d}-{end:02d}"
+
+    return re.sub(
+        r'(?i)S(\d{1,2})E(\d{1,2})[\.\-\s]+(?:AO|ATE)[\.\-\s]+(\d{1,2})(?!\d)',
+        repl,
+        text,
+    )
+
+
 def create_standardized_title(title_original_html: str, year: str, magnet_processed: str, title_translated_html: Optional[str] = None, magnet_original: Optional[str] = None) -> str:
     
     def finalize_title(value: str) -> str:
+        year_str = str(year).strip() if year else ''
+        if year_str and year_str not in (value or ''):
+            value = f"{value}.{year_str}" if value else year_str
         release_for_season_detection = magnet_original if magnet_original else magnet_processed
         value = _apply_season_temporada_tags(value, release_for_season_detection, title_original_html, year)
         value = _reorder_title_components(value)
@@ -302,6 +324,7 @@ def create_standardized_title(title_original_html: str, year: str, magnet_proces
             prev_part = part
     
     clean_release = '.'.join(cleaned_parts).strip('.')
+    clean_release = _normalize_ao_episode_range(clean_release)
     
 
 

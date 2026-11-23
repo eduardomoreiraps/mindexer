@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from utils.parsing.date_extraction import parse_date_from_string
 from typing import List, Dict, Optional, Callable, Tuple
-from urllib.parse import unquote, urljoin
+from urllib.parse import quote, unquote, urljoin
 from bs4 import BeautifulSoup
 from scraper.base import BaseScraper
 from scraper.site_config import SiteConfig
@@ -24,23 +24,23 @@ _log_ctx = ScraperLogContext("TFilme", logger)
 # ║ O site mudou de endereço ou de layout? Edite SOMENTE este bloco.      ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 SITE = SiteConfig(
-    url="https://torrentdosfilmes-v2.xyz/",
+    url="https://www.torrentfilmeshd1.org/",
     caminho_busca="?s=",
-    paginacao="category/dublado/page/{}/",
+    paginacao="genero/filmes/page/{}/",
     seletores={
         # --- Listagem e resultados de busca ---
-        "card": "div.post",              # cada card de filme/série
-        "link_do_card": "div.title > a", # link dentro do card
-        "classe_serie": "blue",          # classe que marca card de série
-        "classe_filme": "green",         # classe que marca card de filme
-        "bloco_secao": "titleGeral",     # classe do bloco que agrupa cada seção da home
+        "card": "article.film-card, article.cover-slide, div.post",
+        "link_do_card": "a.film-card-link, a.button-primary, div.title > a",
+        "classe_serie": "category-series",
+        "classe_filme": "category-filmes",
+        "bloco_secao": "titleGeral",
         "titulo_secao_filmes": "Últimos Filmes Adicionados",
         "titulo_secao_series": "Últimas Séries Adicionadas",
         # --- Página do filme/série ---
-        "artigo": "article",             # bloco principal da página
-        "bloco_titulo": "div.title",     # bloco onde fica o h1 com o título
-        "conteudo": "div.content",       # ficha: Título Original, idioma, tamanho...
-        "paragrafos_conteudo": "div.content p",
+        "artigo": "article.article-main, article",
+        "bloco_titulo": "header.article-header, div.title",
+        "conteudo": "div.entry-content, div.article-body, div.content",
+        "paragrafos_conteudo": "div.entry-content p, div.content p, .download-btn-label, .article-meta",
     },
 )
 
@@ -58,6 +58,7 @@ class TfilmeScraper(BaseScraper):
     SCRAPER_TYPE = "tfilme"
     DEFAULT_BASE_URL = SITE.url
     DISPLAY_NAME = "TFilme"
+    USE_FLARESOLVERR_DEFAULT = False
     
     def __init__(self, base_url: Optional[str] = None, use_flaresolverr: bool = False):
         super().__init__(base_url, use_flaresolverr)
@@ -149,14 +150,27 @@ class TfilmeScraper(BaseScraper):
         href_lower = href.lower()
         return any(hint in href_lower for hint in _TORRENT_LINK_HINTS)
 
-    def _collect_magnet_links(self, doc: BeautifulSoup, article: BeautifulSoup) -> List[str]:
+    def _collect_magnet_links(
+        self, doc: BeautifulSoup, article: BeautifulSoup, dn_fallback: str = ''
+    ) -> List[str]:
         """Coleta magnets: prioriza links de download, depois varre a página e o HTML bruto."""
         magnet_links: List[str] = []
         seen_hashes: set = set()
 
-        def _add_magnet(magnet: str) -> None:
+        def _add_magnet(magnet: str, btn_text: str = '') -> None:
             if not magnet or not magnet.startswith('magnet:'):
                 return
+            if 'dn=' not in magnet.lower() and dn_fallback:
+                parts = [dn_fallback]
+                if btn_text:
+                    clean_btn = re.sub(r'(?i)\bdownload\b|\btorrent\b|[↓↗|]+', ' ', btn_text).strip()
+                    if clean_btn:
+                        parts.append(clean_btn)
+                dn_raw = re.sub(r'[^a-zA-Z0-9._-]+', '.', ' '.join(parts)).strip('.')
+                dn_raw = re.sub(r'\.{2,}', '.', dn_raw)
+                if dn_raw:
+                    sep = '&' if '?' in magnet else '?'
+                    magnet = f"{magnet}{sep}dn={quote(dn_raw)}"
             try:
                 key = MagnetParser.parse(magnet)['info_hash'].lower()
             except Exception:
@@ -173,14 +187,15 @@ class TfilmeScraper(BaseScraper):
                 href = html.unescape((link.get('href') or '').strip())
                 if not href:
                     continue
+                btn_text = link.get_text(' ', strip=True)
                 if self._is_probable_torrent_link(href):
-                    candidates.append(href)
+                    candidates.append((href, btn_text))
                 else:
-                    other.append(href)
-            for href in candidates + other:
+                    other.append((href, btn_text))
+            for href, btn_text in candidates + other:
                 resolved = self._resolve_link(href)
                 if resolved:
-                    _add_magnet(resolved)
+                    _add_magnet(resolved, btn_text=btn_text)
 
         text_content = article.select_one(SITE.seletores["conteudo"])
         if text_content:
@@ -208,6 +223,7 @@ class TfilmeScraper(BaseScraper):
             page_url = build_page_url(self.base_url, self.page_pattern, page)
             
             doc = self.get_document(page_url, self.base_url)
+            self._is_test = False
             if not doc:
                 return []
             
@@ -221,6 +237,8 @@ class TfilmeScraper(BaseScraper):
                     )
             
             effective_max = get_effective_max_items(max_items)
+            if self.use_flaresolverr:
+                effective_max = min(effective_max, 6) if effective_max > 0 else 6
             
             if effective_max > 0:
                 half_limit = max(1, effective_max // 2)
@@ -260,9 +278,22 @@ class TfilmeScraper(BaseScraper):
         doc = self.get_document(absolute_link, self.base_url)
         if not doc:
             return []
-        
-        from utils.parsing.date_extraction import extract_date_from_page
-        date = extract_date_from_page(doc, absolute_link, self.SCRAPER_TYPE)
+
+        for noscript in doc.select('noscript'):
+            noscript.decompose()
+
+        date = None
+        meta_div = doc.select_one('.article-meta')
+        if meta_div:
+            meta_match = re.search(r'(\d{2})\.(\d{2})\.(\d{4})', meta_div.get_text(' ', strip=True))
+            if meta_match:
+                try:
+                    date = datetime.strptime(meta_match.group(0), '%d.%m.%Y')
+                except ValueError:
+                    pass
+        if not date:
+            from utils.parsing.date_extraction import extract_date_from_page
+            date = extract_date_from_page(doc, absolute_link, self.SCRAPER_TYPE)
         
         torrents = []
         article = doc.select_one(SITE.seletores["artigo"])
@@ -270,18 +301,24 @@ class TfilmeScraper(BaseScraper):
             self._log_structure_miss(absolute_link, SITE.seletores["artigo"])
             return []
         
+        raw_h1_text = ''
         page_title = ''
         title_div = article.select_one(SITE.seletores["bloco_titulo"])
-        if title_div:
-            h1 = title_div.find('h1')
-            if h1:
-                page_title = h1.get_text(strip=True).replace(' - Download', '')
-        
-        if not page_title:
+        h1 = title_div.find('h1') if title_div else None
+        if not h1:
             # Layout do título mudou: tenta qualquer h1 da página antes de descartar.
             h1 = article.find('h1') or doc.find('h1')
-            if h1:
-                page_title = h1.get_text(strip=True).replace(' - Download', '')
+        if h1:
+            raw_h1_text = h1.get_text(' ', strip=True)
+            suffix_span = h1.find('span', class_='title-suffix')
+            if suffix_span:
+                suffix_span.decompose()
+            page_title = h1.get_text(' ', strip=True).replace(' - Download', '')
+            page_title = re.sub(
+                r'(?i)\s*torrent\s+(?:dual|dublado|legendado|nacional)?\s*[áa]?udio?\s*download\s*$',
+                '',
+                page_title,
+            ).strip()
         
         if not page_title:
             self._log_structure_miss(absolute_link, 'div.title > h1')
@@ -392,10 +429,31 @@ class TfilmeScraper(BaseScraper):
                     year = y
                 sizes.extend(find_sizes_from_text(text))
         
+        for btn_el in article.select('.download-btn-label, a.download-btn'):
+            btn_text = btn_el.get_text(' ', strip=True)
+            if btn_text:
+                all_paragraphs_html.append(btn_text)
+                sizes.extend(find_sizes_from_text(btn_text))
+                if not audio_info:
+                    from utils.parsing.audio_extraction import detect_audio_from_html
+                    audio_info = detect_audio_from_html(btn_text)
+
+        if raw_h1_text:
+            all_paragraphs_html.append(raw_h1_text)
+            if not audio_info:
+                from utils.parsing.audio_extraction import detect_audio_from_html
+                audio_info = detect_audio_from_html(raw_h1_text)
+
+        if not year:
+            y = find_year_from_text(raw_h1_text or page_title, page_title)
+            if y:
+                year = y
+
         if all_paragraphs_html:
             audio_html_content = ' '.join(all_paragraphs_html)
         
-        magnet_links = self._collect_magnet_links(doc, article)
+        dn_fallback = f"{original_title or page_title} {year}".strip()
+        magnet_links = self._collect_magnet_links(doc, article, dn_fallback=dn_fallback)
         
         if not magnet_links:
             return []

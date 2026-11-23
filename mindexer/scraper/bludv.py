@@ -23,26 +23,28 @@ _log_ctx = ScraperLogContext("Bludv", logger)
 # ║ O site mudou de endereço ou de layout? Edite SOMENTE este bloco.      ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 SITE = SiteConfig(
-    url="https://bludv.ru/",
+    url="https://www.cinetorrents.net/",
     caminho_busca="?s=",
     paginacao="page/{}/",
     seletores={
         # --- Página do filme/série ---
-        "titulo": "h1",                          # título exibido na página
-        "conteudo": "div.content",               # ficha: Título Original, áudio, tamanho...
-        "conteudo_alternativo": "div.entry-content",
-        "artigo": "article",                     # último recurso para achar a ficha
+        "titulo": "h1.cv-title, header.article-header h1, h1.entry-title, h1",
+        "conteudo": "div.cv-information, div.content",
+        "conteudo_alternativo": "section.cv-content-box, div.entry-content",
+        "artigo": "div.cv-single, article",
     },
 )
 # Cards de listagem/busca: testados nesta ordem, o primeiro que encontrar vence.
-_CARD_SELETORES = ('div.post', 'article.post', 'article', '.post')
+_CARD_SELETORES = ('div.item', 'article.col', 'div.post', 'article.post', 'article', '.post')
 # Link dentro do card: testados nesta ordem.
 _LINK_DO_CARD_SELETORES = (
+    'div.title > a',
+    'div.title a',
+    'div.image > a',
     'header.entry-header h1.entry-title a',
     'h1.entry-title a',
     'header.entry-header a',
-    'div.title > a',
-    'div.title a',
+    'a.film-card-link',
     'h2 a',
 )
 
@@ -208,6 +210,9 @@ class BludvScraper(BaseScraper):
         if not doc:
             return []
         
+        for noscript in doc.select('noscript'):
+            noscript.decompose()
+
         from utils.parsing.date_extraction import extract_date_from_page
         date = extract_date_from_page(doc, absolute_link, self.SCRAPER_TYPE)
         
@@ -217,9 +222,15 @@ class BludvScraper(BaseScraper):
         title_elem = doc.select_one(SITE.seletores["titulo"])
         if title_elem:
             page_title = title_elem.get_text(strip=True)
+            page_title = re.sub(r'(?i)\s*torrent\s+.*$', '', page_title).strip()
         
         original_title = ''
+        orig_span = doc.select_one('span.cv-original')
+        if orig_span:
+            orig_text = orig_span.get_text(' ', strip=True)
+            original_title = re.sub(r'(?i)^t[íi]tulo\s+original\s*:\s*', '', orig_text).strip()
         title_translated_processed = ''
+        legend_info = None
         
         content_div = doc.select_one(SITE.seletores["conteudo"])
         if not content_div:
@@ -379,6 +390,39 @@ class BludvScraper(BaseScraper):
                 
                 sizes.extend(find_sizes_from_text(html_content))
 
+        if not year:
+            year_match = re.search(r'\((\d{4})\)', page_title)
+            if year_match:
+                year = year_match.group(1)
+            else:
+                for meta_a in doc.select('div.cv-meta a'):
+                    t = meta_a.get_text(strip=True)
+                    if re.fullmatch(r'(?:19|20)\d{2}', t):
+                        year = t
+                        break
+
+        cv_desc = doc.select_one('div.cv-description')
+        if cv_desc:
+            desc_text = cv_desc.get_text(' ', strip=True)
+            if desc_text:
+                audio_html_content = (audio_html_content + ' ' + desc_text).strip()
+                if not audio_info:
+                    from utils.parsing.audio_extraction import detect_audio_from_html
+                    audio_info = detect_audio_from_html(desc_text)
+
+        btn_texts = []
+        for btn in doc.select('a.download-btn, .download-btn-text, .download-btn-label'):
+            btn_text = btn.get_text(' ', strip=True)
+            if btn_text:
+                btn_texts.append(btn_text)
+                sizes.extend(find_sizes_from_text(btn_text))
+        if btn_texts:
+            joined_btns = ' '.join(btn_texts)
+            audio_html_content = (audio_html_content + ' ' + joined_btns).strip()
+            if not audio_info:
+                from utils.parsing.audio_extraction import detect_audio_from_html
+                audio_info = detect_audio_from_html(joined_btns)
+
         from utils.parsing.imdb_extraction import extract_imdb_from_soup
         imdb = extract_imdb_from_soup(
             content_div,
@@ -390,13 +434,26 @@ class BludvScraper(BaseScraper):
         all_links = doc.select('a[href]')
         
         magnet_links = []
-        for link in all_links:
-            href = link.get('href', '')
+        for link_el in all_links:
+            href = link_el.get('href', '')
             if not href:
                 continue
             
             resolved_magnet = self._resolve_link(href)
             if resolved_magnet and resolved_magnet.startswith('magnet:'):
+                if 'dn=' not in resolved_magnet.lower():
+                    btn_text = link_el.get_text(' ', strip=True)
+                    dn_parts = [original_title or page_title]
+                    if year and year not in (original_title or page_title):
+                        dn_parts.append(year)
+                    if btn_text:
+                        clean_btn = re.sub(r'(?i)\bdownload\b|\btorrent\b|[↓↗|]+', ' ', btn_text).strip()
+                        dn_parts.append(clean_btn)
+                    dn_raw = re.sub(r'[^a-zA-Z0-9._-]+', '.', ' '.join(dn_parts)).strip('.')
+                    dn_raw = re.sub(r'\.{2,}', '.', dn_raw)
+                    if dn_raw:
+                        sep = '&' if '?' in resolved_magnet else '?'
+                        resolved_magnet = f"{resolved_magnet}{sep}dn={quote(dn_raw)}"
                 if resolved_magnet not in magnet_links:
                     magnet_links.append(resolved_magnet)
         

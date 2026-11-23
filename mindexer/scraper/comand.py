@@ -22,22 +22,22 @@ _log_ctx = ScraperLogContext("Comand", logger)
 # ║ O site mudou de endereço ou de layout? Edite SOMENTE este bloco.      ║
 # ╚═══════════════════════════════════════════════════════════════════════╝
 SITE = SiteConfig(
-    url="https://comando1.com/",
+    url="https://www.comandoviafilmes.site/",
     caminho_busca="?s=",
     paginacao="page/{}/",
     seletores={
         # --- Listagem e resultados de busca ---
-        "card": "article",                            # cada card da listagem
-        "card_busca": "article.post",                 # card nos resultados de busca
+        "card": "article, a.card",                    # cada card da listagem
+        "card_busca": "article.post, a.card",         # card nos resultados de busca
         "link_do_card": "h2.entry-title a",           # link principal do card
         "link_do_card_alternativo": "header.entry-header h1.entry-title a, h1.entry-title a, header.entry-header a",
         "link_busca": "header.entry-header h1.entry-title a",
         "link_busca_alternativo": "h1.entry-title a, header.entry-header a",
         # --- Página do filme/série ---
         "artigo": "article",                          # bloco principal da página
-        "titulo": "h1.entry-title, header.entry-header h1.entry-title",
-        "conteudo": "div.entry-content",              # ficha: Título Original, tamanho...
-        "data_publicacao": 'div.entry-date[itemprop="datePublished"]',
+        "titulo": "h1.entry-title, header.entry-header h1.entry-title, h1",
+        "conteudo": "div.entry-content, div.story",   # ficha: Título Original, tamanho...
+        "data_publicacao": 'div.entry-date[itemprop="datePublished"], ul.facts li',
     },
 )
 
@@ -91,9 +91,12 @@ class ComandScraper(BaseScraper):
     def _extract_links_from_page(self, doc: BeautifulSoup) -> List[str]:
         links = []
         for article in doc.select(SITE.seletores["card"]):
-            link_elem = article.select_one(SITE.seletores["link_do_card"])
-            if not link_elem:
-                link_elem = article.select_one(SITE.seletores["link_do_card_alternativo"])
+            if article.name == 'a' and article.get('href'):
+                link_elem = article
+            else:
+                link_elem = article.select_one(SITE.seletores["link_do_card"])
+                if not link_elem:
+                    link_elem = article.select_one(SITE.seletores["link_do_card_alternativo"])
             
             if link_elem:
                 href = link_elem.get('href')
@@ -110,18 +113,28 @@ class ComandScraper(BaseScraper):
     def _extract_search_results(self, doc: BeautifulSoup) -> List[str]:
         links = []
         for article in doc.select(SITE.seletores["card_busca"]):
-            link_elem = article.select_one(SITE.seletores["link_busca"])
+            if article.name == 'a' and article.get('href'):
+                link_elem = article
+            else:
+                link_elem = article.select_one(SITE.seletores["link_busca"])
             if link_elem:
                 href = link_elem.get('href')
                 if href:
+                    if not href.startswith('http'):
+                        href = urljoin(self.base_url, href)
                     links.append(href)
         
         if not links:
             for article in doc.select(SITE.seletores["card"]):
-                link_elem = article.select_one(SITE.seletores["link_busca_alternativo"])
+                if article.name == 'a' and article.get('href'):
+                    link_elem = article
+                else:
+                    link_elem = article.select_one(SITE.seletores["link_busca_alternativo"])
                 if link_elem:
                     href = link_elem.get('href')
                     if href:
+                        if not href.startswith('http'):
+                            href = urljoin(self.base_url, href)
                         links.append(href)
         return links
 
@@ -138,8 +151,8 @@ class ComandScraper(BaseScraper):
         date_elem = doc.select_one(SITE.seletores["data_publicacao"])
         if date_elem:
             date_link = date_elem.find('a')
-            if date_link:
-                date_text = date_link.get_text(strip=True)
+            date_text = date_link.get_text(strip=True) if date_link else date_elem.get_text(strip=True)
+            if date_text:
                 try:
                     date = self._parse_localized_date(date_text)
                 except (ValueError, AttributeError):
@@ -201,7 +214,7 @@ class ComandScraper(BaseScraper):
             
             if not original_title:
                 title_original_match = re.search(
-                    r'<b>T[íi]tulo Original[:\s]*</b>\s*(?:<br\s*/?>)?\s*([^<]+?)(?:<span|<br|</p|</b|<strong|Gênero|Sinopse|Lançamento|Duração|Formato|Qualidade|Áudio|Audio|Legenda|Tamanho|IMDb|TEMPORADA|$)',
+                    r'<b>T[íi]tulo Original[:\s]*</b>[:\s]*(?:<br\s*/?>)?\s*([^<]+?)(?:<span|<br|</p|</b|<strong|Gênero|Sinopse|Lançamento|Ano de Lançamento|Duração|Formato|Qualidade|Áudio|Audio|Legenda|Tamanho|IMDb|TEMPORADA|$)',
                     html_content,
                     re.IGNORECASE | re.DOTALL
                 )
@@ -374,7 +387,7 @@ class ComandScraper(BaseScraper):
             
             if not title_translated_processed:
                 title_traduzido_match = re.search(
-                    r'<b>T[íi]tulo Traduzido[:\s]*</b>\s*(?:<br\s*/?>)?\s*([^<]+?)(?:<br|</p|$)', 
+                    r'<b>T[íi]tulo Traduzido[:\s]*</b>[:\s]*(?:<br\s*/?>)?\s*([^<]+?)(?:<br|</p|$)', 
                     html_content,
                     re.IGNORECASE | re.DOTALL
                 )
